@@ -16,7 +16,8 @@
 ##########################################
 
 # base image
-FROM pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime
+# Note: pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime for 5090gpu
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
 # packages
