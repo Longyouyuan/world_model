@@ -1,0 +1,163 @@
+import types
+import unittest
+
+import torch
+import torch.nn.functional as F
+
+from state_anchored.config import apply_state_anchored_defaults
+from state_anchored.world_model import StateAnchoredWorldModel
+
+
+def make_cfg(**overrides):
+	values = {
+		"obs": "state",
+		"multitask": False,
+		"obs_shape": {"state": (5,)},
+		"action_dim": 2,
+		"latent_dim": 16,
+		"enc_dim": 16,
+		"enc_lr_scale": 0.3,
+		"num_enc_layers": 2,
+		"mlp_dim": 32,
+		"simnorm_dim": 8,
+		"num_q": 2,
+		"num_bins": 11,
+		"vmin": -5.0,
+		"vmax": 5.0,
+		"bin_size": 1.0,
+		"dropout": 0.0,
+		"episodic": False,
+		"log_std_min": -10.0,
+		"log_std_max": 2.0,
+		"tau": 0.01,
+	}
+	values.update(overrides)
+	return apply_state_anchored_defaults(types.SimpleNamespace(**values))
+
+
+class StateAnchoredWorldModelTest(unittest.TestCase):
+	def setUp(self):
+		torch.manual_seed(7)
+		self.cfg = make_cfg()
+		self.model = StateAnchoredWorldModel(self.cfg)
+		self.state = torch.randn(4, 5)
+		self.action = torch.randn(4, 2).tanh()
+
+	def assert_finite(self, *tensors):
+		for tensor in tensors:
+			self.assertTrue(torch.isfinite(tensor).all().item())
+
+	def test_encode_features_and_head_shapes(self):
+		encoded = self.model.encode(self.state)
+		self.assertIs(encoded, self.state)
+		features = self.model.features(self.state)
+		next_state = self.model.next(self.state, self.action)
+		reward = self.model.reward(self.state, self.action)
+		policy_action, policy_info = self.model.pi(self.state)
+		q_all = self.model.Q(
+			self.state, self.action, return_type="all"
+		)
+
+		self.assertEqual(features.shape, (4, 21))
+		self.assertEqual(next_state.shape, self.state.shape)
+		self.assertEqual(reward.shape, (4, 11))
+		self.assertEqual(policy_action.shape, (4, 2))
+		self.assertEqual(policy_info["mean"].shape, (4, 2))
+		self.assertEqual(policy_info["entropy"].shape, (4, 1))
+		self.assertEqual(q_all.shape, (2, 4, 11))
+		self.assertEqual(
+			self.model._Qs.params["2", "weight"].shape,
+			(2, 11, 32),
+		)
+		self.assertFalse(self.model._target_Qs.training)
+		self.model.train()
+		self.assertFalse(self.model._target_Qs.training)
+		self.model.to("cpu")
+		self.assertFalse(self.model._target_Qs.training)
+		self.assert_finite(
+			features, next_state, reward, policy_action, q_all,
+			policy_info["log_std"], policy_info["scaled_entropy"],
+		)
+
+	def test_zero_initialized_dynamics_is_identity(self):
+		predicted = self.model.next(self.state, self.action)
+		torch.testing.assert_close(predicted, self.state, atol=1e-7, rtol=0)
+		self.assertEqual(self.model.state_norm.count.item(), 0)
+
+	def test_temporal_inputs_and_feature_recomputation(self):
+		states = torch.randn(3, 4, 5)
+		actions = torch.randn(3, 4, 2).tanh()
+		calls = []
+		handle = self.model._encoder.register_forward_hook(
+			lambda _module, _inputs, _output: calls.append(1)
+		)
+		try:
+			first = self.model.next(states[0], actions[0])
+			second = self.model.next(first, actions[1])
+		finally:
+			handle.remove()
+		self.assertEqual(len(calls), 2)
+
+		features = self.model.features(states)
+		next_states = self.model.next(states, actions)
+		reward = self.model.reward(states, actions)
+		q_all = self.model.Q(states, actions, return_type="all")
+		self.assertEqual(features.shape, (3, 4, 21))
+		self.assertEqual(next_states.shape, states.shape)
+		self.assertEqual(reward.shape, (3, 4, 11))
+		self.assertEqual(q_all.shape, (2, 3, 4, 11))
+		self.assert_finite(first, second, features, next_states, reward, q_all)
+
+	def test_gradients_reach_feature_encoder_and_dynamics(self):
+		model = StateAnchoredWorldModel(make_cfg(
+			sa_zero_init_dynamics_output=False
+		))
+		with torch.no_grad():
+			torch.nn.init.normal_(model._reward[-1].weight, std=0.02)
+			model._Qs.params["2", "weight"].normal_(std=0.02)
+		state = torch.randn(4, 5)
+		action = torch.randn(4, 2).tanh()
+		target = torch.randn(4, 5)
+		predicted = model.next(state, action)
+		loss = (
+			F.mse_loss(model.normalize_state(predicted), target)
+			+ model.reward(state, action).mean()
+			+ model.Q(state, action, return_type="all").mean()
+		)
+		loss.backward()
+		encoder_grads = [
+			parameter.grad for parameter in model._encoder.parameters()
+			if parameter.grad is not None
+		]
+		dynamics_grads = [
+			parameter.grad for parameter in model._dynamics.parameters()
+			if parameter.grad is not None
+		]
+		self.assertTrue(encoder_grads)
+		self.assertTrue(dynamics_grads)
+		self.assertTrue(any(gradient.abs().sum() > 0 for gradient in encoder_grads))
+		self.assertTrue(any(gradient.abs().sum() > 0 for gradient in dynamics_grads))
+
+	def test_optional_direct_prediction_and_termination(self):
+		model = StateAnchoredWorldModel(make_cfg(
+			sa_predict_delta=False,
+			episodic=True,
+		))
+		next_state = model.next(self.state, self.action)
+		termination = model.termination(self.state)
+		termination_logits = model.termination(self.state, unnormalized=True)
+		self.assertEqual(next_state.shape, self.state.shape)
+		self.assertEqual(termination.shape, (4, 1))
+		self.assertEqual(termination_logits.shape, (4, 1))
+		self.assertTrue(torch.all((termination >= 0) & (termination <= 1)))
+		self.assert_finite(next_state, termination, termination_logits)
+
+	def test_configuration_rejects_unsupported_modes(self):
+		with self.assertRaisesRegex(NotImplementedError, "obs=state"):
+			make_cfg(obs="rgb")
+		with self.assertRaisesRegex(NotImplementedError, "single-task"):
+			make_cfg(multitask=True)
+
+
+if __name__ == "__main__":
+	unittest.main()
