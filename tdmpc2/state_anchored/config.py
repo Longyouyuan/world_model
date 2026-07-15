@@ -18,6 +18,7 @@ DEFAULTS = {
 	"sa_norm_freeze_updates": 100_000,
 	# Dynamics
 	"sa_predict_delta": True,
+	"sa_delta_limit": 5.0,
 	"sa_dynamics_hidden_dim": None,
 	"sa_dynamics_layers": 2,
 	"sa_zero_init_dynamics_output": True,
@@ -86,6 +87,13 @@ def apply_state_anchored_defaults(cfg: Any) -> Any:
 		raise ValueError("State feature dimensions must be positive.")
 	if cfg.sa_dynamics_hidden_dim <= 0:
 		raise ValueError("sa_dynamics_hidden_dim must be positive.")
+	if cfg.sa_delta_limit <= 0:
+		raise ValueError("sa_delta_limit must be positive.")
+	if not cfg.sa_predict_delta:
+		raise NotImplementedError(
+			"The stabilized State-Anchored model only supports normalized "
+			"delta prediction."
+		)
 	if cfg.sa_state_loss == "smooth_l1" and cfg.sa_state_loss_beta <= 0:
 		raise ValueError("sa_state_loss_beta must be positive for smooth_l1.")
 	if cfg.sa_feature_simnorm and cfg.sa_feature_dim % cfg.simnorm_dim != 0:

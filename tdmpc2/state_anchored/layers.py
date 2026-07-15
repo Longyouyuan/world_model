@@ -35,6 +35,8 @@ class RunningStateNorm(nn.Module):
 		self.register_buffer("count", torch.zeros((), dtype=torch.float64))
 		self.register_buffer("mean", torch.zeros(self.state_dim, dtype=torch.float64))
 		self.register_buffer("m2", torch.zeros(self.state_dim, dtype=torch.float64))
+		self.register_buffer("initialized", torch.tensor(False, dtype=torch.bool))
+		self.register_buffer("num_fit_states", torch.zeros((), dtype=torch.long))
 
 	def _check_shape(self, states: torch.Tensor) -> None:
 		if states.ndim < 1 or states.shape[-1] != self.state_dim:
@@ -51,6 +53,11 @@ class RunningStateNorm(nn.Module):
 		if batch.shape[0] == 0:
 			return
 		batch = batch.to(device=self.mean.device, dtype=torch.float64)
+		self._merge_batch(batch)
+
+	@torch.no_grad()
+	def _merge_batch(self, batch: torch.Tensor) -> None:
+		"""Merge a non-empty float64 batch already on the statistics device."""
 		batch_count = torch.as_tensor(
 			batch.shape[0], device=self.count.device, dtype=torch.float64
 		)
@@ -69,6 +76,38 @@ class RunningStateNorm(nn.Module):
 		self.mean.copy_(new_mean)
 		self.m2.copy_(new_m2)
 		self.count.copy_(total_count)
+
+	@torch.no_grad()
+	def fit(self, states: torch.Tensor) -> None:
+		"""Reset and fit statistics once to all finite real replay states."""
+		self._check_shape(states)
+		batch = states.detach().reshape(-1, self.state_dim)
+		finite_rows = torch.isfinite(batch).all(dim=-1)
+		batch = batch[finite_rows]
+		if batch.shape[0] < 2:
+			raise ValueError(
+				"RunningStateNorm.fit requires at least two finite states; "
+				f"got {batch.shape[0]}."
+			)
+
+		batch = batch.to(device=self.mean.device, dtype=torch.float64)
+		self.count.zero_()
+		self.mean.zero_()
+		self.m2.zero_()
+		self.initialized.fill_(False)
+		self.num_fit_states.zero_()
+		self._merge_batch(batch)
+		self.num_fit_states.fill_(batch.shape[0])
+		self.initialized.fill_(True)
+
+		print(
+			"State normalizer initialized: "
+			f"state_norm_num_states={batch.shape[0]}, "
+			f"state_norm_mean_abs={self.mean.abs().mean().item():.6g}, "
+			f"state_norm_std_mean={self.std.mean().item():.6g}, "
+			f"state_norm_std_min={self.std.min().item():.6g}, "
+			f"state_norm_std_max={self.std.max().item():.6g}"
+		)
 
 	@property
 	def var(self) -> torch.Tensor:
@@ -91,26 +130,26 @@ class RunningStateNorm(nn.Module):
 		std = self.std.to(device=tensor.device, dtype=tensor.dtype)
 		return mean, std
 
-	def normalize(self, state: torch.Tensor) -> torch.Tensor:
-		"""Normalize raw state while preserving its dtype and device."""
+	def normalize_unclipped(self, state: torch.Tensor) -> torch.Tensor:
+		"""Normalize raw state without clipping, preserving dtype and device."""
 		mean, std = self._stats_like(state)
-		normalized = (state - mean) / std
+		return (state - mean) / std
+
+	def clip_normalized(self, normalized_state: torch.Tensor) -> torch.Tensor:
+		"""Clip an already-normalized state for neural-network input."""
+		self._check_shape(normalized_state)
 		if self.clip is not None:
-			normalized = normalized.clamp(-self.clip, self.clip)
-		return normalized
+			return normalized_state.clamp(-self.clip, self.clip)
+		return normalized_state
+
+	def normalize_for_input(self, state: torch.Tensor) -> torch.Tensor:
+		"""Normalize a raw state, then clip it for neural-network input."""
+		return self.clip_normalized(self.normalize_unclipped(state))
 
 	def denormalize(self, normalized: torch.Tensor) -> torch.Tensor:
 		"""Map an unclipped normalized state back to raw state space."""
 		mean, std = self._stats_like(normalized)
 		return normalized * std + mean
-
-	def scale_delta(self, normalized_delta: torch.Tensor) -> torch.Tensor:
-		"""Map normalized deltas to raw deltas without clipping."""
-		self._check_shape(normalized_delta)
-		std = self.std.to(
-			device=normalized_delta.device, dtype=normalized_delta.dtype
-		)
-		return normalized_delta * std
 
 	def __repr__(self) -> str:
 		return (

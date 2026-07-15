@@ -1,4 +1,4 @@
-"""World model whose recursive carrier is the raw environment state."""
+"""World model whose recursive carrier is the unclipped normalized state."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from state_anchored.layers import (
 
 
 class StateAnchoredWorldModel(nn.Module):
-	"""TD-MPC2 world model that rolls out raw states instead of latent states."""
+	"""TD-MPC2 world model that rolls out normalized states instead of latents."""
 
 	def __init__(self, cfg):
 		super().__init__()
@@ -172,27 +172,33 @@ class StateAnchoredWorldModel(nn.Module):
 		assert task is None, "State-Anchored TD-MPC2 does not support task IDs."
 
 	def encode(self, obs: torch.Tensor, task=None) -> torch.Tensor:
-		"""Return the raw state unchanged as the recursive model carrier."""
+		"""Map a raw state to the unclipped normalized recursive carrier."""
 		self._assert_single_task(task)
-		return obs
+		return self.state_norm.normalize_unclipped(obs)
 
-	def normalize_state(self, state: torch.Tensor) -> torch.Tensor:
-		return self.state_norm.normalize(state)
+	def decode_state(self, normalized_state: torch.Tensor) -> torch.Tensor:
+		"""Map an unclipped normalized carrier back to raw state space."""
+		return self.state_norm.denormalize(normalized_state)
 
-	def features(self, state: torch.Tensor) -> torch.Tensor:
-		"""Recompute anchored features from the current raw state."""
-		normalized_state = self.normalize_state(state)
-		feature = self._encoder(normalized_state)
-		return torch.cat([normalized_state, feature], dim=-1)
+	def features(self, normalized_state: torch.Tensor) -> torch.Tensor:
+		"""Recompute anchored features from the current normalized carrier."""
+		network_state = self.state_norm.clip_normalized(normalized_state)
+		feature = self._encoder(network_state)
+		return torch.cat([network_state, feature], dim=-1)
 
-	def next(self, state: torch.Tensor, action: torch.Tensor, task=None) -> torch.Tensor:
-		"""Predict the next raw state from the current raw state and action."""
+	def next(
+		self,
+		normalized_state: torch.Tensor,
+		action: torch.Tensor,
+		task=None,
+	) -> torch.Tensor:
+		"""Predict the next carrier using a bounded normalized residual."""
 		self._assert_single_task(task)
-		anchored = self.features(state)
-		prediction = self._dynamics(torch.cat([anchored, action], dim=-1))
-		if self.cfg.sa_predict_delta:
-			return state + self.state_norm.scale_delta(prediction)
-		return self.state_norm.denormalize(prediction)
+		anchored = self.features(normalized_state)
+		raw_delta = self._dynamics(torch.cat([anchored, action], dim=-1))
+		limit = self.cfg.sa_delta_limit
+		bounded_delta = limit * torch.tanh(raw_delta / limit)
+		return normalized_state + bounded_delta
 
 	def reward(self, state: torch.Tensor, action: torch.Tensor, task=None) -> torch.Tensor:
 		self._assert_single_task(task)

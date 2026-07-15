@@ -13,7 +13,9 @@ from tdmpc2 import TDMPC2
 
 
 class StateAnchoredTDMPC2(TDMPC2):
-	"""TD-MPC2 agent with a raw-state recursive world-model carrier."""
+	"""TD-MPC2 agent with an unclipped normalized-state model carrier."""
+
+	_CHECKPOINT_VERSION = 2
 
 	def __init__(self, cfg):
 		# Do not call TDMPC2.__init__: it constructs the official latent model.
@@ -79,34 +81,87 @@ class StateAnchoredTDMPC2(TDMPC2):
 		states: torch.Tensor,
 		real_states: torch.Tensor,
 	) -> dict[str, torch.Tensor]:
-		std = self.model.state_norm.std.to(
-			device=states.device, dtype=states.dtype
-		)
-		normalized_states = self.model.normalize_state(states)
-		predicted_delta = (states[1:] - states[:-1]) / std
+		raw_states = self.model.decode_state(states)
+		real_x = self.model.encode(real_states)
+		predicted_delta = states[1:] - states[:-1]
+		clip = self.cfg.sa_norm_clip
+		if clip is None:
+			imagined_clip_fraction = torch.zeros((), device=states.device)
+			real_clip_fraction = torch.zeros((), device=states.device)
+		else:
+			imagined_clip_fraction = (states.abs() > clip).float().mean()
+			real_clip_fraction = (real_x.abs() > clip).float().mean()
 		diagnostics = {
+			"state_norm_num_states": self.model.state_norm.num_fit_states.to(
+				device=states.device, dtype=states.dtype
+			),
 			"state_norm_mean_abs": self.model.state_norm.mean.abs().mean(),
 			"state_norm_std_mean": self.model.state_norm.std.mean(),
 			"state_norm_std_min": self.model.state_norm.std.min(),
 			"state_norm_std_max": self.model.state_norm.std.max(),
-			"imagined_state_abs_max": states.abs().max(),
-			"normalized_imagined_state_abs_max": normalized_states.abs().max(),
+			"imagined_state_abs_max": raw_states.abs().max(),
+			"normalized_imagined_state_abs_max": states.abs().max(),
 			"predicted_normalized_delta_abs_mean": predicted_delta.abs().mean(),
 			"predicted_normalized_delta_abs_max": predicted_delta.abs().max(),
+			"imagined_state_clip_fraction": imagined_clip_fraction,
+			"real_state_clip_fraction": real_clip_fraction,
 		}
 		for step in (1, 3):
 			if step < states.shape[0] and step < real_states.shape[0]:
-				difference = (
-					self.model.normalize_state(states[step])
-					- self.model.normalize_state(real_states[step])
-				)
+				difference = states[step] - real_x[step]
 				diagnostics[f"state_nrmse_{step}"] = (
 					difference.square().mean(dim=-1).sqrt().mean()
 				)
 		return diagnostics
 
+	def _all_replay_states(self, buffer) -> torch.Tensor:
+		"""Read every stored replay observation exactly once without sampling."""
+		if not hasattr(buffer, "_buffer"):
+			raise RuntimeError(
+				"State-Anchored normalizer initialization requires a replay wrapper "
+				"with a '_buffer' ReplayBuffer field."
+			)
+		replay = buffer._buffer
+		try:
+			num_entries = len(replay)
+		except TypeError as exc:
+			raise RuntimeError(
+				"State-Anchored normalizer could not determine replay length."
+			) from exc
+		if num_entries == 0:
+			raise RuntimeError(
+				"State-Anchored normalizer cannot initialize from an empty replay."
+			)
+		try:
+			stored = replay[:num_entries]
+		except (IndexError, KeyError, TypeError, RuntimeError) as exc:
+			raise RuntimeError(
+				"State-Anchored normalizer could not index all replay entries "
+				"with the installed TorchRL API."
+			) from exc
+		if not hasattr(stored, "get"):
+			raise RuntimeError(
+				"State-Anchored replay indexing did not return a TensorDict-like object."
+			)
+		states = stored.get("obs", None)
+		if not isinstance(states, torch.Tensor):
+			raise RuntimeError(
+				"State-Anchored replay storage does not contain a tensor 'obs' field."
+			)
+		state_dim = self.cfg.obs_shape["state"][0]
+		if states.ndim < 1 or states.shape[-1] != state_dim:
+			raise RuntimeError(
+				f"Expected replay observations with final dimension {state_dim}, "
+				f"got shape {tuple(states.shape)}."
+			)
+		return states
+
 	def update(self, buffer):
-		"""Update running state statistics, then run one compiled model update."""
+		"""Initialize/update state statistics, then run one model update."""
+		if not bool(self.model.state_norm.initialized.item()):
+			all_seed_states = self._all_replay_states(buffer)
+			self.model.state_norm.fit(all_seed_states)
+
 		obs, action, reward, terminated, task = buffer.sample()
 		if task is not None:
 			raise NotImplementedError(
@@ -142,14 +197,12 @@ class StateAnchoredTDMPC2(TDMPC2):
 			zip(action.unbind(0), next_state.unbind(0))
 		):
 			state = self.model.next(state, _action, task)
-			predicted_normalized = self.model.normalize_state(state)
-			target_normalized = self.model.normalize_state(target_next_state)
 			if self.cfg.sa_state_loss == "mse":
-				step_loss = F.mse_loss(predicted_normalized, target_normalized)
+				step_loss = F.mse_loss(state, target_next_state)
 			else:
 				step_loss = F.smooth_l1_loss(
-					predicted_normalized,
-					target_normalized,
+					state,
+					target_next_state,
 					beta=self.cfg.sa_state_loss_beta,
 				)
 			state_loss = state_loss + step_loss * self.cfg.rho ** t
@@ -252,3 +305,52 @@ class StateAnchoredTDMPC2(TDMPC2):
 			else torch.tensor(value, device=self.device)
 			for key, value in info.items()
 		}
+
+	def save(self, fp) -> None:
+		"""Save the stabilized carrier version and normalizer freeze counter."""
+		torch.save({
+			"state_anchored_checkpoint_version": self._CHECKPOINT_VERSION,
+			"model": self.model.state_dict(),
+			"sa_update_count": self._sa_update_count.detach().cpu(),
+		}, fp)
+
+	def load(self, fp) -> None:
+		"""Load only checkpoints using the stabilized normalized carrier."""
+		if isinstance(fp, dict):
+			checkpoint = fp
+		else:
+			checkpoint = torch.load(
+				fp,
+				map_location=torch.get_default_device(),
+				weights_only=False,
+			)
+		if not isinstance(checkpoint, dict) or checkpoint.get(
+			"state_anchored_checkpoint_version"
+		) != self._CHECKPOINT_VERSION:
+			raise RuntimeError(
+				"Incompatible State-Anchored checkpoint: stabilized normalized-carrier "
+				"checkpoint version 2 is required; legacy raw-carrier checkpoints "
+				"cannot be loaded."
+			)
+		model_state = checkpoint.get("model")
+		if not isinstance(model_state, dict) or "state_norm.initialized" not in model_state:
+			raise RuntimeError(
+				"Incompatible State-Anchored checkpoint: normalizer initialization "
+				"state is missing."
+			)
+		if not bool(model_state["state_norm.initialized"].item()):
+			raise RuntimeError(
+				"Cannot load a State-Anchored checkpoint with an uninitialized "
+				"state normalizer."
+			)
+		if "sa_update_count" not in checkpoint:
+			raise RuntimeError(
+				"Incompatible State-Anchored checkpoint: normalizer freeze counter "
+				"is missing."
+			)
+		super().load({"model": model_state})
+		self._sa_update_count.copy_(torch.as_tensor(
+			checkpoint["sa_update_count"],
+			device=self._sa_update_count.device,
+			dtype=self._sa_update_count.dtype,
+		))
