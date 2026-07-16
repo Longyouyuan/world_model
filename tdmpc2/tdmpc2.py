@@ -331,7 +331,7 @@ class TDMPC2(torch.nn.Module):
 		return {k: v.detach().mean() if isinstance(v, torch.Tensor) else torch.tensor(v) \
 			for k, v in info.items()}
 
-	def update(self, buffer):
+	def update(self, buffer, log_diagnostics=False):
 		"""
 		Main update function. Corresponds to one iteration of model learning.
 

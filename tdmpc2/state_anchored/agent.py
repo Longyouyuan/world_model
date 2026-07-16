@@ -60,6 +60,8 @@ class StateAnchoredTDMPC2(TDMPC2):
 			"_sa_update_count",
 			torch.tensor(0, dtype=torch.long, device=self.device),
 		)
+		self._norm_initialized: bool = False
+		self._sa_update_count_cpu: int = 0
 		if self.cfg.compile:
 			print("Compiling update function with torch.compile...")
 			self._update = torch.compile(self._update, mode="reduce-overhead")
@@ -156,26 +158,29 @@ class StateAnchoredTDMPC2(TDMPC2):
 			)
 		return states
 
-	def update(self, buffer):
+	def update(self, buffer, log_diagnostics=True):
 		"""Initialize/update state statistics, then run one model update."""
-		if not bool(self.model.state_norm.initialized.item()):
+		if not self._norm_initialized:
 			all_seed_states = self._all_replay_states(buffer)
 			self.model.state_norm.fit(all_seed_states)
+			self._norm_initialized = True
 
 		obs, action, reward, terminated, task = buffer.sample()
 		if task is not None:
 			raise NotImplementedError(
 				"State-Anchored TD-MPC2 does not support multitask replay batches."
 			)
-		if self._sa_update_count.item() < self.cfg.sa_norm_freeze_updates:
+		if self._sa_update_count_cpu < self.cfg.sa_norm_freeze_updates:
 			# Only actual replay observations are allowed to update these statistics.
 			self.model.state_norm.update(obs)
+		log_this_step = self.cfg.sa_log_diagnostics and log_diagnostics
 		self._sa_update_count.add_(1)
+		self._sa_update_count_cpu += 1
 
 		torch.compiler.cudagraph_mark_step_begin()
-		return self._update(obs, action, reward, terminated)
+		return self._update(obs, action, reward, terminated, log_this_step=log_this_step)
 
-	def _update(self, obs, action, reward, terminated, task=None):
+	def _update(self, obs, action, reward, terminated, task=None, log_this_step: bool = False):
 		self.model._assert_single_task(task)
 		with torch.no_grad():
 			next_state = self.model.encode(obs[1:], task)
@@ -209,11 +214,13 @@ class StateAnchoredTDMPC2(TDMPC2):
 			states[t + 1] = state
 
 		model_states = states[:-1]
-		qs = self.model.Q(model_states, action, task, return_type="all")
-		reward_preds = self.model.reward(model_states, action, task)
+		model_features = self.model.features(model_states)
+		qs = self.model.Q(model_states, action, task, return_type="all", _features=model_features)
+		reward_preds = self.model.reward(model_states, action, task, _features=model_features)
 		if self.cfg.episodic:
+			term_features = self.model.features(states[1:])
 			termination_pred = self.model.termination(
-				states[1:], task, unnormalized=True
+				states[1:], task, unnormalized=True, _features=term_features
 			)
 
 		reward_loss = torch.zeros((), device=self.device, dtype=obs.dtype)
@@ -257,11 +264,11 @@ class StateAnchoredTDMPC2(TDMPC2):
 
 		diagnostics = (
 			self._state_diagnostics(states.detach(), obs)
-			if self.cfg.sa_log_diagnostics
+			if log_this_step
 			else {}
 		)
 		total_loss.backward()
-		if self.cfg.sa_log_diagnostics:
+		if log_this_step:
 			diagnostics.update({
 				"feature_encoder_grad_norm": self._module_grad_norm(
 					self.model._encoder, self.device
@@ -277,9 +284,7 @@ class StateAnchoredTDMPC2(TDMPC2):
 		self.optim.zero_grad(set_to_none=True)
 
 		pi_info = self.update_pi(states.detach(), task)
-		# Recomputed features create encoder gradients during the inherited actor
-		# backward pass. The encoder is not an actor parameter; clear those grads
-		# so they cannot leak into the next model update.
+		# Clear any encoder gradients that may have leaked during the actor update.
 		self.optim.zero_grad(set_to_none=True)
 		self.model.soft_update_target_Q()
 
@@ -304,6 +309,182 @@ class StateAnchoredTDMPC2(TDMPC2):
 			if isinstance(value, torch.Tensor)
 			else torch.tensor(value, device=self.device)
 			for key, value in info.items()
+		}
+
+	@torch.no_grad()
+	def _td_target(self, next_z, reward, terminated, task):
+		"""Compute TD-target, sharing features between pi and target Q."""
+		features = self.model.features(next_z)
+		action, _ = self.model.pi(next_z, task, _features=features)
+		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
+		return reward + discount * (1 - terminated) * self.model.Q(
+			next_z, action, task, return_type="min", target=True, _features=features
+		)
+
+	@torch.no_grad()
+	def _estimate_value(self, state, actions, task, initial_features=None):
+		"""Estimate a trajectory using one feature computation per state."""
+		self.model._assert_single_task(task)
+		value, discount = 0, 1
+		termination = torch.zeros(
+			self.cfg.num_samples,
+			1,
+			dtype=torch.float32,
+			device=state.device,
+		)
+		features = (
+			initial_features
+			if initial_features is not None
+			else self.model.features(state)
+		)
+		for t in range(self.cfg.horizon):
+			reward = math.two_hot_inv(
+				self.model.reward(state, actions[t], task, _features=features),
+				self.cfg,
+			)
+			state = self.model.next(
+				state, actions[t], task, _features=features
+			)
+			value = value + discount * (1 - termination) * reward
+			discount = discount * self.discount
+			features = self.model.features(state)
+			if self.cfg.episodic:
+				termination = torch.clip(
+					termination
+					+ (
+						self.model.termination(
+							state, task, _features=features
+						)
+						> 0.5
+					).float(),
+					max=1.0,
+				)
+		action, _ = self.model.pi(state, task, _features=features)
+		return value + discount * (1 - termination) * self.model.Q(
+			state,
+			action,
+			task,
+			return_type="avg",
+			_features=features,
+		)
+
+	@torch.no_grad()
+	def _plan(self, obs, t0=False, eval_mode=False, task=None):
+		"""Plan with MPPI while sharing features within each imagined state."""
+		self.model._assert_single_task(task)
+		state = self.model.encode(obs, task)
+		if self.cfg.num_pi_trajs > 0:
+			pi_actions = torch.empty(
+				self.cfg.horizon,
+				self.cfg.num_pi_trajs,
+				self.cfg.action_dim,
+				device=self.device,
+			)
+			pi_state = state.repeat(self.cfg.num_pi_trajs, 1)
+			pi_features = self.model.features(pi_state)
+			for t in range(self.cfg.horizon - 1):
+				pi_actions[t], _ = self.model.pi(
+					pi_state, task, _features=pi_features
+				)
+				pi_state = self.model.next(
+					pi_state,
+					pi_actions[t],
+					task,
+					_features=pi_features,
+				)
+				pi_features = self.model.features(pi_state)
+			pi_actions[-1], _ = self.model.pi(
+				pi_state, task, _features=pi_features
+			)
+
+		state = state.repeat(self.cfg.num_samples, 1)
+		initial_features = self.model.features(state)
+		mean = torch.zeros(
+			self.cfg.horizon, self.cfg.action_dim, device=self.device
+		)
+		std = torch.full(
+			(self.cfg.horizon, self.cfg.action_dim),
+			self.cfg.max_std,
+			dtype=torch.float,
+			device=self.device,
+		)
+		if not t0:
+			mean[:-1] = self._prev_mean[1:]
+		actions = torch.empty(
+			self.cfg.horizon,
+			self.cfg.num_samples,
+			self.cfg.action_dim,
+			device=self.device,
+		)
+		if self.cfg.num_pi_trajs > 0:
+			actions[:, :self.cfg.num_pi_trajs] = pi_actions
+
+		for _ in range(self.cfg.iterations):
+			r = torch.randn(
+				self.cfg.horizon,
+				self.cfg.num_samples - self.cfg.num_pi_trajs,
+				self.cfg.action_dim,
+				device=std.device,
+			)
+			actions_sample = mean.unsqueeze(1) + std.unsqueeze(1) * r
+			actions_sample = actions_sample.clamp(-1, 1)
+			actions[:, self.cfg.num_pi_trajs:] = actions_sample
+
+			value = self._estimate_value(
+				state, actions, task, initial_features=initial_features
+			).nan_to_num(0)
+			elite_idxs = torch.topk(
+				value.squeeze(1), self.cfg.num_elites, dim=0
+			).indices
+			elite_value, elite_actions = value[elite_idxs], actions[:, elite_idxs]
+
+			max_value = elite_value.max(0).values
+			score = torch.exp(
+				self.cfg.temperature * (elite_value - max_value)
+			)
+			score = score / score.sum(0)
+			mean = (
+				(score.unsqueeze(0) * elite_actions).sum(dim=1)
+				/ (score.sum(0) + 1e-9)
+			)
+			std = (
+				(score.unsqueeze(0) * (elite_actions - mean.unsqueeze(1)) ** 2)
+				.sum(dim=1)
+				/ (score.sum(0) + 1e-9)
+			).sqrt()
+			std = std.clamp(self.cfg.min_std, self.cfg.max_std)
+
+		rand_idx = math.gumbel_softmax_sample(score.squeeze(1))
+		actions = torch.index_select(elite_actions, 1, rand_idx).squeeze(1)
+		action, std = actions[0], std[0]
+		if not eval_mode:
+			action = action + std * torch.randn(
+				self.cfg.action_dim, device=std.device
+			)
+		self._prev_mean.copy_(mean)
+		return action.clamp(-1, 1)
+
+	def update_pi(self, zs, task):
+		"""Update policy, computing features once shared between pi and Q."""
+		features = self.model.features(zs).detach()
+		action, info = self.model.pi(zs, task, _features=features)
+		qs = self.model.Q(zs, action, task, return_type='avg', detach=True, _features=features)
+		self.scale.update(qs[0])
+		qs = self.scale(qs)
+
+		rho = torch.pow(self.cfg.rho, torch.arange(len(qs), device=self.device))
+		pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1, 2)) * rho).mean()
+		pi_loss.backward()
+		pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
+		self.pi_optim.step()
+		self.pi_optim.zero_grad(set_to_none=True)
+
+		return {
+			"pi_loss": pi_loss,
+			"pi_grad_norm": pi_grad_norm,
+			"pi_entropy": info["entropy"],
+			"pi_scaled_entropy": info["scaled_entropy"],
+			"pi_scale": self.scale.value,
 		}
 
 	def save(self, fp) -> None:
@@ -349,8 +530,10 @@ class StateAnchoredTDMPC2(TDMPC2):
 				"is missing."
 			)
 		super().load({"model": model_state})
+		self._norm_initialized = True
 		self._sa_update_count.copy_(torch.as_tensor(
 			checkpoint["sa_update_count"],
 			device=self._sa_update_count.device,
 			dtype=self._sa_update_count.dtype,
 		))
+		self._sa_update_count_cpu = int(checkpoint["sa_update_count"].item())

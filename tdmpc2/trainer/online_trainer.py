@@ -118,8 +118,11 @@ class OnlineTrainer(Trainer):
 					print('Pretraining agent on seed data...')
 				else:
 					num_updates = 1
-				for _ in range(num_updates):
-					_train_metrics = self.agent.update(self.buffer)
+				for update_idx in range(num_updates):
+					_train_metrics = self.agent.update(
+						self.buffer,
+						log_diagnostics=(update_idx == num_updates - 1),
+					)
 				train_metrics.update(_train_metrics)
 
 			self._step += 1

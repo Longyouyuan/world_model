@@ -181,7 +181,7 @@ class StateAnchoredWorldModel(nn.Module):
 		return self.state_norm.denormalize(normalized_state)
 
 	def features(self, normalized_state: torch.Tensor) -> torch.Tensor:
-		"""Recompute anchored features from the current normalized carrier."""
+		"""Compute anchored features from the normalized carrier."""
 		network_state = self.state_norm.clip_normalized(normalized_state)
 		feature = self._encoder(network_state)
 		return torch.cat([network_state, feature], dim=-1)
@@ -191,18 +191,20 @@ class StateAnchoredWorldModel(nn.Module):
 		normalized_state: torch.Tensor,
 		action: torch.Tensor,
 		task=None,
+		*,
+		_features=None,
 	) -> torch.Tensor:
 		"""Predict the next carrier using a bounded normalized residual."""
 		self._assert_single_task(task)
-		anchored = self.features(normalized_state)
+		anchored = _features if _features is not None else self.features(normalized_state)
 		raw_delta = self._dynamics(torch.cat([anchored, action], dim=-1))
 		limit = self.cfg.sa_delta_limit
 		bounded_delta = limit * torch.tanh(raw_delta / limit)
 		return normalized_state + bounded_delta
 
-	def reward(self, state: torch.Tensor, action: torch.Tensor, task=None) -> torch.Tensor:
+	def reward(self, state: torch.Tensor, action: torch.Tensor, task=None, *, _features=None) -> torch.Tensor:
 		self._assert_single_task(task)
-		anchored = self.features(state)
+		anchored = _features if _features is not None else self.features(state)
 		return self._reward(torch.cat([anchored, action], dim=-1))
 
 	def termination(
@@ -210,17 +212,21 @@ class StateAnchoredWorldModel(nn.Module):
 		state: torch.Tensor,
 		task=None,
 		unnormalized: bool = False,
+		*,
+		_features=None,
 	) -> torch.Tensor:
 		self._assert_single_task(task)
 		if self._termination is None:
 			raise RuntimeError("Termination head is disabled when cfg.episodic is false.")
-		logits = self._termination(self.features(state))
+		anchored = _features if _features is not None else self.features(state)
+		logits = self._termination(anchored)
 		return logits if unnormalized else torch.sigmoid(logits)
 
-	def pi(self, state: torch.Tensor, task=None):
+	def pi(self, state: torch.Tensor, task=None, *, _features=None):
 		"""Sample an action from the official Gaussian policy prior."""
 		self._assert_single_task(task)
-		mean, log_std = self._pi(self.features(state)).chunk(2, dim=-1)
+		anchored = _features if _features is not None else self.features(state)
+		mean, log_std = self._pi(anchored).chunk(2, dim=-1)
 		log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
 		eps = torch.randn_like(mean)
 
@@ -247,13 +253,16 @@ class StateAnchoredWorldModel(nn.Module):
 		return_type: str = "min",
 		target: bool = False,
 		detach: bool = False,
+		*,
+		_features=None,
 	) -> torch.Tensor:
 		"""Evaluate the official distributional Q ensemble on anchored features."""
 		self._assert_single_task(task)
 		if return_type not in {"min", "avg", "all"}:
 			raise ValueError("return_type must be one of {'min', 'avg', 'all'}.")
 
-		q_input = torch.cat([self.features(state), action], dim=-1)
+		anchored = _features if _features is not None else self.features(state)
+		q_input = torch.cat([anchored, action], dim=-1)
 		if target:
 			qnet = self._target_Qs
 		elif detach:
