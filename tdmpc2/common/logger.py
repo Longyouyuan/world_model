@@ -1,4 +1,5 @@
 import dataclasses
+import csv
 import os
 import datetime
 import re
@@ -17,6 +18,9 @@ CONSOLE_FORMAT = [
 	("episode_reward", "R", "float"),
 	("episode_success", "S", "float"),
 	("elapsed_time", "T", "time"),
+	("act_ms", "act_ms", "float"),
+	("env_ms", "env_ms", "float"),
+	("upd_ms", "upd_ms", "float"),
 ]
 
 CAT_TO_COLOR = {
@@ -24,6 +28,15 @@ CAT_TO_COLOR = {
 	"train": "blue",
 	"eval": "green",
 }
+
+RUNTIME_CSV_KEYS = [
+	"step", "elapsed_time", "steps_per_second", "act_ms", "env_ms", "upd_ms",
+	"act_wall_ms", "env_wall_ms", "to_td_wall_ms", "update_submit_wall_ms",
+	"online_step_wall_ms", "act_cuda_interval_ms", "update_cuda_interval_ms",
+	"replay_sample_submit_ms", "state_norm_fit_submit_ms", "state_norm_submit_ms",
+	"compiled_update_submit_ms", "buffer_add_wall_ms", "logger_wall_ms",
+	"env_reset_wall_ms", "reset_to_td_wall_ms",
+]
 
 
 def make_dir(dir_path):
@@ -114,6 +127,7 @@ class Logger:
 		self._group = cfg_to_group(cfg)
 		self._seed = cfg.seed
 		self._eval = []
+		self._runtime_csv_initialized = False
 		print_run(cfg)
 		self.project = cfg.get("wandb_project", "none")
 		self.entity = cfg.get("wandb_entity", "none")
@@ -238,4 +252,12 @@ class Logger:
 			pd.DataFrame(np.array(self._eval)).to_csv(
 				self._log_dir / "eval.csv", header=keys, index=None
 			)
+		if category == "train" and self._save_csv:
+			mode = "a" if self._runtime_csv_initialized else "w"
+			with open(self._log_dir / "runtime.csv", mode, newline="") as f:
+				writer = csv.DictWriter(f, fieldnames=RUNTIME_CSV_KEYS)
+				if not self._runtime_csv_initialized:
+					writer.writeheader()
+				writer.writerow({key: d.get(key, "") for key in RUNTIME_CSV_KEYS})
+			self._runtime_csv_initialized = True
 		self._print(d, category)

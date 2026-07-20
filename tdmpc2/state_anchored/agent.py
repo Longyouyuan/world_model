@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from time import perf_counter
+
 import torch
 import torch.nn.functional as F
 
@@ -64,7 +66,8 @@ class StateAnchoredTDMPC2(TDMPC2):
 		self._sa_update_count_cpu: int = 0
 		if self.cfg.compile:
 			print("Compiling update function with torch.compile...")
-			self._update = torch.compile(self._update, mode="reduce-overhead")
+			# self._update = torch.compile(self._update, mode="reduce-overhead")
+			self._update = torch.compile(self._update, mode="default")
 
 	@staticmethod
 	def _module_grad_norm(module: torch.nn.Module, device: torch.device) -> torch.Tensor:
@@ -160,25 +163,36 @@ class StateAnchoredTDMPC2(TDMPC2):
 
 	def update(self, buffer, log_diagnostics=True):
 		"""Initialize/update state statistics, then run one model update."""
+		timing = {}
 		if not self._norm_initialized:
+			_t = perf_counter()
 			all_seed_states = self._all_replay_states(buffer)
 			self.model.state_norm.fit(all_seed_states)
 			self._norm_initialized = True
+			timing["state_norm_fit_submit_ms"] = 1e3 * (perf_counter() - _t)
 
+		_t = perf_counter()
 		obs, action, reward, terminated, task = buffer.sample()
+		timing["replay_sample_submit_ms"] = 1e3 * (perf_counter() - _t)
 		if task is not None:
 			raise NotImplementedError(
 				"State-Anchored TD-MPC2 does not support multitask replay batches."
 			)
 		if self._sa_update_count_cpu < self.cfg.sa_norm_freeze_updates:
 			# Only actual replay observations are allowed to update these statistics.
+			_t = perf_counter()
 			self.model.state_norm.update(obs)
+			timing["state_norm_submit_ms"] = 1e3 * (perf_counter() - _t)
 		log_this_step = self.cfg.sa_log_diagnostics and log_diagnostics
 		self._sa_update_count.add_(1)
 		self._sa_update_count_cpu += 1
 
 		torch.compiler.cudagraph_mark_step_begin()
-		return self._update(obs, action, reward, terminated, log_this_step=log_this_step)
+		_t = perf_counter()
+		result = self._update(obs, action, reward, terminated, log_this_step=log_this_step)
+		timing["compiled_update_submit_ms"] = 1e3 * (perf_counter() - _t)
+		self._last_runtime_timing = timing
+		return result
 
 	def _update(self, obs, action, reward, terminated, task=None, log_this_step: bool = False):
 		self.model._assert_single_task(task)

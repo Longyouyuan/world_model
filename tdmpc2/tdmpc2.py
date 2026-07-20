@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from time import perf_counter
 
 from common import math
 from common.scale import RunningScale
@@ -341,9 +342,16 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			dict: Dictionary of training statistics.
 		"""
+		timing = {}
+		_t = perf_counter()
 		obs, action, reward, terminated, task = buffer.sample()
+		timing["replay_sample_submit_ms"] = 1e3 * (perf_counter() - _t)
 		kwargs = {}
 		if task is not None:
 			kwargs["task"] = task
 		torch.compiler.cudagraph_mark_step_begin()
-		return self._update(obs, action, reward, terminated, **kwargs)
+		_t = perf_counter()
+		result = self._update(obs, action, reward, terminated, **kwargs)
+		timing["compiled_update_submit_ms"] = 1e3 * (perf_counter() - _t)
+		self._last_runtime_timing = timing
+		return result
