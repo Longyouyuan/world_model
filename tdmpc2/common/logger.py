@@ -244,7 +244,8 @@ class Logger:
 				xkey = "iteration"
 			_d = dict()
 			for k, v in d.items():
-				_d[category + "/" + k] = v
+				prefix = "time" if k.endswith("_ms") else category
+				_d[prefix + "/" + k] = v
 			self._wandb.log(_d, step=d[xkey])
 		if category == "eval" and self._save_csv:
 			keys = ["step", "episode_reward"]
